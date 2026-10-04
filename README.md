@@ -15,7 +15,7 @@ Webs sniffer that uses mitmproxy library to intercept HTTP/HTTPS traffic and ext
 ### Installation
 
    ```sh
-   pipx install -r requirements.txt
+   pipx install mitmproxy
    ```
 
 ### Running the Sniffer
