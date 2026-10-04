@@ -23,7 +23,7 @@ Webs sniffer that uses mitmproxy library to intercept HTTP/HTTPS traffic and ext
 To start the sniffer, run the following command:
 
 ```sh
-mitmproxy -s sniffer.py
+mitmdump -s sniffer.py
 ```
 
 ### Configuration
