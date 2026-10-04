@@ -1,5 +1,39 @@
+"""
+img_sniffer.py v2 - mitmproxy addon: deep media capture from proxied traffic.
+
+Run:  mitmdump -s img_sniffer.py                          # passive (default)
+      mitmdump -s img_sniffer.py --set sniff_mode=crawler  # active crawler
+      (or env SNIFF_MODE=crawler)
+
+MODES
+  passive  only what the browser actually loads for the page you are looking at.
+           No extra requests, no extra traffic. Still decodes data: URIs and inline <svg>.
+  crawler  everything in passive PLUS discovered URLs are fetched and parsed
+           recursively (lazy images, CSS assets, srcset variants, manifests...).
+           Fetches wait `crawl_delay` seconds and skip anything the browser loaded
+           meanwhile, so nothing is downloaded twice.
+
+What it does
+  PASSIVE   every response is sniffed by magic bytes (not Content-Type / URL), so
+            mislabeled files, extension-less URLs and octet-stream downloads are caught.
+            Images, video, audio, documents, fonts (+ optional archives/other).
+  DEEP      HTML / CSS / JS / JSON / XML / manifest / m3u8 responses are parsed for:
+            <img src|srcset>, <picture>, <video poster>, lazy-load attrs (data-src,...),
+            meta og:image, link icons/manifest/stylesheets, <a href> to media/docs,
+            CSS url() / @import / image-set, any quoted media URL inside JS/JSON,
+            base64 + percent-encoded data: URIs (decoded and saved), inline <svg>.
+  CRAWL     discovered URLs are fetched (depth-limited, concurrency-limited) and
+            parsed again, so lazy-loaded / never-scrolled-into-view assets are caught.
+  FRESH     conditional headers are stripped so cached assets (304) come back as 200.
+  OTHER     WebSocket frames and (optional) uploads are scanned too.
+  MULTICORE all CPU work runs in a process pool; the proxy hook returns immediately.
+            Worker code is embedded below and written to a temp module at startup.
+
+All settings are in CFG. Worker count: SNIFF_WORKERS=N
+"""
 import asyncio
 import csv
+import logging
 import os
 import re
 import shutil
@@ -14,6 +48,9 @@ from urllib.parse import urlparse
 
 from mitmproxy import http, ctx
 
+# ----------------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------------
 CFG = {
     "out_dir": "sniffed_media",        # <out_dir>/<category>/<host>/<name>_<sha10>.<ext>
     "out_csv": "media.csv",
@@ -61,6 +98,7 @@ CFG = {
     "fetch_concurrency": 12,
     "fetch_max_bytes": 100 << 20,
     "max_text_bytes": 5 << 20,
+    "crawl_delay": 3.0,                # crawler: wait so the browser can load its own files first
 
     # --- traffic tweaks ---
     "strip_conditional": True,         # drop If-None-Match / If-Modified-Since -> no 304s
@@ -72,6 +110,15 @@ CFG = {
     "workers": int(os.environ.get("SNIFF_WORKERS", max(1, (os.cpu_count() or 2) - 1))),
     "max_pending": 256,
     "title_cache": 3000,
+}
+
+PRESETS = {
+    "passive": {
+        "fetch_referenced": False, "crawl_css": False, "crawl_js": False, "max_depth": 0,
+    },
+    "crawler": {
+        "fetch_referenced": True, "crawl_css": True, "crawl_js": False, "max_depth": 3,
+    },
 }
 
 EXTS = {
@@ -470,6 +517,8 @@ def noop():
     return 1
 '''
 
+log = logging.getLogger("imgsniff")
+
 # ----------------------------------------------------------------------------
 # STATE
 # ----------------------------------------------------------------------------
@@ -479,6 +528,7 @@ _tmpdir = None
 _csv_f = None
 _csv_w = None
 _seen_urls = set()
+_loaded = set()          # URLs the browser itself fetched (crawler skips these)
 _titles = OrderedDict()
 _stats = Counter()
 _pending = 0
@@ -503,9 +553,13 @@ def _host_ok(host: str) -> bool:
     return not _any(_host_block, host)
 
 
-def _prepare_cfg():
-    """Derive runtime fields (also used by tests)."""
+def _prepare_cfg(mode="passive"):
+    """Apply mode preset + derive runtime fields (also used by tests)."""
     global _max_any, _host_allow, _host_block, _url_block, _ref_allow
+    if mode not in PRESETS:
+        raise ValueError(f"sniff_mode must be one of {list(PRESETS)}, got {mode!r}")
+    CFG.update(PRESETS[mode])
+    CFG["mode"] = mode
     CFG["out_dir"] = os.path.abspath(CFG["out_dir"])
     exts = []
     for cat, on in CFG["categories"].items():
@@ -548,7 +602,7 @@ def _record(m, page_url, depth):
     _csv_f.flush()
     _stats["saved"] += 1
     _stats["saved:" + m["category"]] += 1
-    ctx.log.info(f"[{m['category']}] {m['path']} {m['w']}x{m['h']} {m['size']}B d{depth} <- {m['url']}")
+    log.info(f"[{m['category']}] {m['path']} {m['w']}x{m['h']} {m['size']}B d{depth} <- {m['url']}")
 
 
 def _schedule(urls, doc_url, depth, hdrs):
@@ -590,12 +644,16 @@ async def _run(body, url, ctype, referer, source, depth, hdrs):
         res = await loop.run_in_executor(_pool, _W.handle, body, url, ctype, CFG, source)
         _consume(res, url, referer, depth, hdrs)
     except Exception as e:
-        ctx.log.warn(f"task error {url}: {e}")
+        log.warning(f"task error {url}: {e}")
     finally:
         _pending -= 1
 
 
 async def _fetch(url, referer, depth, hdrs):
+    await asyncio.sleep(CFG["crawl_delay"])
+    if url in _loaded:                      # browser got it meanwhile -> already captured
+        _stats["skip:browser_loaded"] += 1
+        return
     async with _fetch_sem:
         fh = {"User-Agent": hdrs["ua"], "Accept": "*/*", "Accept-Language": hdrs["lang"],
               "Accept-Encoding": "gzip, deflate", "Referer": referer}
@@ -606,7 +664,7 @@ async def _fetch(url, referer, depth, hdrs):
             res = await loop.run_in_executor(_pool, _W.fetch_handle, url, fh, CFG)
             _consume(res, url, referer, depth, hdrs)
         except Exception as e:
-            ctx.log.warn(f"fetch error {url}: {e}")
+            log.warning(f"fetch error {url}: {e}")
 
 
 def _submit(body, url, ctype, referer, source, depth, hdrs):
@@ -674,7 +732,7 @@ def request(flow: http.HTTPFlow) -> None:
             for part in parts:
                 _submit(part, url, ct, h.get("referer", ""), "upload", 0, _hdrs(flow))
         except Exception as e:
-            ctx.log.warn(f"upload scan error: {e}")
+            log.warning(f"upload scan error: {e}")
 
 
 def response(flow: http.HTTPFlow) -> None:
@@ -684,6 +742,9 @@ def response(flow: http.HTTPFlow) -> None:
     if not (r.status_code in CFG["status_codes"] or (r.status_code == 206 and _complete_206(r))):
         return
     url = flow.request.pretty_url
+    if len(_loaded) > 300_000:
+        _loaded.clear()
+    _loaded.add(url)
     if not _host_ok(flow.request.pretty_host) or _any(_url_block, url):
         _stats["skip:blocked"] += 1
         return
@@ -707,9 +768,14 @@ def websocket_message(flow: http.HTTPFlow) -> None:
             "websocket", 0, _hdrs(flow))
 
 
+def load(loader) -> None:
+    loader.add_option("sniff_mode", str, os.environ.get("SNIFF_MODE", "passive"),
+                      "Sniffer mode: passive | crawler")
+
+
 def running() -> None:
     global _W, _pool, _tmpdir, _csv_f, _csv_w, _fetch_sem, _index
-    _prepare_cfg()
+    _prepare_cfg(ctx.options.sniff_mode)
 
     _tmpdir = tempfile.mkdtemp(prefix="imgsniff_")
     with open(os.path.join(_tmpdir, "imgsniff_worker.py"), "w", encoding="utf-8") as f:
@@ -742,13 +808,12 @@ def running() -> None:
         _csv_w.writerow(CSV_HEADER)
         _csv_f.flush()
     on = [c for c, v in CFG["categories"].items() if v]
-    ctx.log.info(f"Sniffer ready: {CFG['workers']} workers, categories={on}, "
-                 f"crawl={'on' if CFG['fetch_referenced'] else 'off'} depth={CFG['max_depth']}, "
-                 f"out={CFG['out_dir']}")
+    log.info(f"Sniffer ready [{CFG['mode']}]: {CFG['workers']} workers, categories={on}, "
+                 f"depth={CFG['max_depth']}, out={CFG['out_dir']}")
 
 
 def done() -> None:
-    ctx.log.info("Sniffer stats: " + ", ".join(f"{k}={v}" for k, v in sorted(_stats.items())))
+    log.info("Sniffer stats: " + ", ".join(f"{k}={v}" for k, v in sorted(_stats.items())))
     if _pool:
         _pool.shutdown(wait=False, cancel_futures=True)
     if _csv_f:
